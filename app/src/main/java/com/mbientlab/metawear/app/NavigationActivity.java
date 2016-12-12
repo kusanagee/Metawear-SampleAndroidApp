@@ -63,13 +63,9 @@ import android.support.v7.app.AppCompatActivity;
 import android.support.v7.widget.Toolbar;
 import android.view.Menu;
 import android.view.MenuItem;
-import android.view.View;
 
-import com.mbientlab.metawear.AsyncOperation;
-import com.mbientlab.metawear.MetaWearBleService;
 import com.mbientlab.metawear.MetaWearBoard;
-import com.mbientlab.metawear.MetaWearBoard.ConnectionStateHandler;
-import com.mbientlab.metawear.UnsupportedModuleException;
+import com.mbientlab.metawear.android.BtleService;
 import com.mbientlab.metawear.app.ModuleFragmentBase.FragmentBus;
 import com.mbientlab.metawear.module.Debug;
 
@@ -79,6 +75,9 @@ import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.Map;
 
+import bolts.Capture;
+import bolts.Continuation;
+import bolts.Task;
 import no.nordicsemi.android.dfu.DfuBaseService;
 import no.nordicsemi.android.dfu.DfuProgressListener;
 import no.nordicsemi.android.dfu.DfuProgressListenerAdapter;
@@ -141,7 +140,7 @@ public class NavigationActivity extends AppCompatActivity implements NavigationV
         @Override
         public Dialog onCreateDialog(Bundle savedInstanceState) {
             btDevice= getArguments().getParcelable(KEY_BLUETOOTH_DEVICE);
-            getActivity().getApplicationContext().bindService(new Intent(getActivity(), MetaWearBleService.class), this, BIND_AUTO_CREATE);
+            getActivity().getApplicationContext().bindService(new Intent(getActivity(), BtleService.class), this, BIND_AUTO_CREATE);
 
             reconnectDialog = new ProgressDialog(getActivity());
             reconnectDialog.setTitle(getString(R.string.title_reconnect_attempt));
@@ -149,12 +148,9 @@ public class NavigationActivity extends AppCompatActivity implements NavigationV
             reconnectDialog.setCancelable(false);
             reconnectDialog.setCanceledOnTouchOutside(false);
             reconnectDialog.setIndeterminate(true);
-            reconnectDialog.setButton(DialogInterface.BUTTON_NEGATIVE, getString(R.string.label_cancel), new DialogInterface.OnClickListener() {
-                @Override
-                public void onClick(DialogInterface dialogInterface, int i) {
-                    currentMwBoard.disconnect();
-                    getActivity().finish();
-                }
+            reconnectDialog.setButton(DialogInterface.BUTTON_NEGATIVE, getString(R.string.label_cancel), (dialogInterface, i) -> {
+                currentMwBoard.disconnectAsync();
+                getActivity().finish();
             });
 
             return reconnectDialog;
@@ -162,7 +158,7 @@ public class NavigationActivity extends AppCompatActivity implements NavigationV
 
         @Override
         public void onServiceConnected(ComponentName name, IBinder service) {
-            currentMwBoard= ((MetaWearBleService.LocalBinder) service).getMetaWearBoard(btDevice);
+            currentMwBoard= ((BtleService.LocalBinder) service).getMetaWearBoard(btDevice);
         }
 
         @Override
@@ -215,36 +211,6 @@ public class NavigationActivity extends AppCompatActivity implements NavigationV
     private String fileName;
     private Intent dfuParameters= null;
 
-    private final ConnectionStateHandler connectionHandler= new MetaWearBoard.ConnectionStateHandler() {
-        @Override
-        public void connected() {
-            ((DialogFragment) getSupportFragmentManager().findFragmentByTag(RECONNECT_DIALOG_TAG)).dismiss();
-            ((ModuleFragmentBase) currentFragment).reconnected();
-        }
-
-        @Override
-        public void disconnected() {
-            if (dfuParameters != null) {
-                startService(dfuParameters);
-            } else {
-                attemptReconnect();
-            }
-        }
-
-        @Override
-        public void failure(int status, Throwable error) {
-            Fragment reconnectFragment= getSupportFragmentManager().findFragmentByTag(RECONNECT_DIALOG_TAG);
-            if (reconnectFragment != null) {
-                mwBoard.connect();
-            } else {
-                if (dfuParameters != null) {
-                    startService(dfuParameters);
-                } else {
-                    attemptReconnect();
-                }
-            }
-        }
-    };
     private final DfuProgressListener dfuProgressListener= new DfuProgressListenerAdapter() {
         @Override
         public void onProgressChanged(String deviceAddress, int percent, float speed, float avgSpeed, int currentPart, int partsTotal) {
@@ -273,23 +239,29 @@ public class NavigationActivity extends AppCompatActivity implements NavigationV
         }
     };
 
+    private Continuation<Void, Void> reconnectResult= task -> {
+        ((DialogFragment) getSupportFragmentManager().findFragmentByTag(RECONNECT_DIALOG_TAG)).dismiss();
+
+        if (task.isCancelled()) {
+            finish();
+        } else {
+            ((ModuleFragmentBase) currentFragment).reconnected();
+        }
+
+        return null;
+    };
+
     private void attemptReconnect() {
         attemptReconnect(0);
     }
-
     private void attemptReconnect(long delay) {
         ReconnectDialogFragment dialogFragment= ReconnectDialogFragment.newInstance(btDevice);
         dialogFragment.show(getSupportFragmentManager(), RECONNECT_DIALOG_TAG);
 
         if (delay != 0) {
-            taskScheduler.postDelayed(new Runnable() {
-                @Override
-                public void run() {
-                    mwBoard.connect();
-                }
-            }, delay);
+            taskScheduler.postDelayed(() -> ScannerActivity.reconnect(mwBoard).continueWith(reconnectResult), delay);
         } else {
-            mwBoard.connect();
+            ScannerActivity.reconnect(mwBoard).continueWith(reconnectResult);
         }
     }
 
@@ -300,7 +272,6 @@ public class NavigationActivity extends AppCompatActivity implements NavigationV
 
     @Override
     public void resetConnectionStateHandler(long delay) {
-        mwBoard.setConnectionStateHandler(connectionHandler);
         attemptReconnect(delay);
     }
 
@@ -345,45 +316,30 @@ public class NavigationActivity extends AppCompatActivity implements NavigationV
             return;
         }
 
-        taskScheduler.post(new Runnable() {
-            @Override
-            public void run() {
-                if (path == null) {
-                    mwBoard.downloadLatestFirmware().onComplete(new AsyncOperation.CompletionHandler<File>() {
-                        @Override
-                        public void success(File result) {
-                            DfuProgressFragment.newInstance(R.string.message_dfu).show(getSupportFragmentManager(), DFU_PROGRESS_FRAGMENT_TAG);
-                            dfuParameters.putExtra(DfuBaseService.EXTRA_FILE_PATH, result.getAbsolutePath());
-                            addMimeType(result.getAbsolutePath());
+        taskScheduler.post(() -> {
+            if (path == null) {
+                DfuProgressFragment.newInstance(R.string.message_dfu).show(getSupportFragmentManager(), DFU_PROGRESS_FRAGMENT_TAG);
 
-                            if (mwBoard.inMetaBootMode()) {
-                                mwBoard.disconnect();
+                Capture<File> firmwareCapture = new Capture<>();
+                mwBoard.downloadLatestFirmwareAsync()
+                        .onSuccessTask(task -> {
+                            firmwareCapture.set(task.getResult());
+                            return mwBoard.inMetaBoot() ? mwBoard.disconnectAsync() : mwBoard.getModule(Debug.class).jumpToBootloader();
+                        })
+                        .continueWith(task -> {
+                            if (task.isFaulted()) {
+                                Snackbar.make(NavigationActivity.this.findViewById(R.id.drawer_layout), task.getError().getLocalizedMessage(), Snackbar.LENGTH_LONG).show();
                             } else {
-                                try {
-                                    mwBoard.getModule(Debug.class).jumpToBootloader();
-                                } catch (UnsupportedModuleException e) {
-                                    Snackbar.make(NavigationActivity.this.findViewById(R.id.drawer_layout), R.string.error_bootloader, Snackbar.LENGTH_LONG).show();
-                                }
+                                addMimeType(firmwareCapture.get().getAbsolutePath());
+                                dfuParameters.putExtra(DfuBaseService.EXTRA_FILE_PATH, firmwareCapture.get().getAbsolutePath());
+                                startService(dfuParameters);
                             }
-                        }
-
-                        @Override
-                        public void failure(Throwable error) {
-                            Snackbar.make(NavigationActivity.this.findViewById(R.id.drawer_layout), error.getLocalizedMessage(), Snackbar.LENGTH_LONG).show();
-                        }
-                    });
-                } else{
-                    DfuProgressFragment.newInstance(R.string.message_manual_dfu).show(getSupportFragmentManager(), DFU_PROGRESS_FRAGMENT_TAG);
-                    if (mwBoard.inMetaBootMode()) {
-                        mwBoard.disconnect();
-                    } else {
-                        try {
-                            mwBoard.getModule(Debug.class).jumpToBootloader();
-                        } catch (UnsupportedModuleException e) {
-                            Snackbar.make(NavigationActivity.this.findViewById(R.id.drawer_layout), R.string.error_bootloader, Snackbar.LENGTH_LONG).show();
-                        }
-                    }
-                }
+                            return null;
+                        });
+            } else{
+                DfuProgressFragment.newInstance(R.string.message_manual_dfu).show(getSupportFragmentManager(), DFU_PROGRESS_FRAGMENT_TAG);
+                (mwBoard.inMetaBoot() ? mwBoard.disconnectAsync() : mwBoard.getModule(Debug.class).jumpToBootloader())
+                        .continueWith(ignored -> startService(dfuParameters));
             }
         });
     }
@@ -392,8 +348,6 @@ public class NavigationActivity extends AppCompatActivity implements NavigationV
     public void onDestroy() {
         super.onDestroy();
 
-        ///< Unbind the service when the activity is destroyed
-        mwBoard.setConnectionStateHandler(null);
         getApplicationContext().unbindService(this);
     }
 
@@ -405,12 +359,7 @@ public class NavigationActivity extends AppCompatActivity implements NavigationV
         setSupportActionBar(toolbar);
 
         FloatingActionButton fab = (FloatingActionButton) findViewById(R.id.fab);
-        fab.setOnClickListener(new View.OnClickListener() {
-            @Override
-            public void onClick(View view) {
-                ((ModuleFragmentBase) currentFragment).showHelpDialog();
-            }
-        });
+        fab.setOnClickListener(view -> ((ModuleFragmentBase) currentFragment).showHelpDialog());
 
         DrawerLayout drawer = (DrawerLayout) findViewById(R.id.drawer_layout);
         ActionBarDrawerToggle toggle = new ActionBarDrawerToggle(this, drawer, toolbar, R.string.navigation_drawer_open, R.string.navigation_drawer_close);
@@ -427,7 +376,7 @@ public class NavigationActivity extends AppCompatActivity implements NavigationV
         }
 
         btDevice= getIntent().getParcelableExtra(EXTRA_BT_DEVICE);
-        getApplicationContext().bindService(new Intent(this, MetaWearBleService.class), this, BIND_AUTO_CREATE);
+        getApplicationContext().bindService(new Intent(this, BtleService.class), this, BIND_AUTO_CREATE);
 
         final SharedPreferences preferences = PreferenceManager.getDefaultSharedPreferences(this);
         preferences.edit().putBoolean(DfuSettingsConstants.SETTINGS_ASSUME_DFU_NODE, true).apply();
@@ -483,8 +432,7 @@ public class NavigationActivity extends AppCompatActivity implements NavigationV
         if (drawer.isDrawerOpen(GravityCompat.START)) {
             drawer.closeDrawer(GravityCompat.START);
         } else {
-            mwBoard.setConnectionStateHandler(null);
-            mwBoard.disconnect();
+            mwBoard.disconnectAsync();
             super.onBackPressed();
         }
     }
@@ -505,16 +453,15 @@ public class NavigationActivity extends AppCompatActivity implements NavigationV
 
         switch(id) {
             case R.id.action_reset:
-                try {
-                    mwBoard.getModule(Debug.class).resetDevice();
-                    Snackbar.make(findViewById(R.id.drawer_layout), R.string.message_soft_reset, Snackbar.LENGTH_LONG).show();
-                } catch (UnsupportedModuleException e) {
-                    Snackbar.make(findViewById(R.id.drawer_layout), R.string.error_soft_reset, Snackbar.LENGTH_LONG).show();
-                }
+                mwBoard.getModule(Debug.class).reset()
+                        .continueWith(ignored -> {
+                            attemptReconnect(0);
+                            return null;
+                        });
+                Snackbar.make(findViewById(R.id.drawer_layout), R.string.message_soft_reset, Snackbar.LENGTH_LONG).show();
                 return true;
             case R.id.action_disconnect:
-                mwBoard.setConnectionStateHandler(null);
-                mwBoard.disconnect();
+                mwBoard.disconnectAsync();
                 finish();
                 return true;
             case R.id.action_manual_dfu:
@@ -528,7 +475,7 @@ public class NavigationActivity extends AppCompatActivity implements NavigationV
     }
 
     @Override
-    public boolean onNavigationItemSelected(MenuItem item) {
+    public boolean onNavigationItemSelected(@NonNull MenuItem item) {
         // Handle navigation view item clicks here.
         int id = item.getItemId();
 
@@ -567,8 +514,8 @@ public class NavigationActivity extends AppCompatActivity implements NavigationV
 
     @Override
     public void onServiceConnected(ComponentName name, IBinder service) {
-        mwBoard= ((MetaWearBleService.LocalBinder) service).getMetaWearBoard(btDevice);
-        mwBoard.setConnectionStateHandler(connectionHandler);
+        mwBoard= ((BtleService.LocalBinder) service).getMetaWearBoard(btDevice);
+        mwBoard.onUnexpectedDisconnect(status -> attemptReconnect());
     }
 
     @Override
@@ -633,12 +580,7 @@ public class NavigationActivity extends AppCompatActivity implements NavigationV
             builder.setTitle(R.string.title_request_permission);
             builder.setMessage(R.string.permission_read_external_storage);
             builder.setPositiveButton(android.R.string.ok, null);
-            builder.setOnDismissListener(new DialogInterface.OnDismissListener() {
-                @Override
-                public void onDismiss(DialogInterface dialog) {
-                    requestPermissions(new String[]{Manifest.permission.READ_EXTERNAL_STORAGE}, PERMISSION_REQUEST_READ_STORAGE);
-                }
-            });
+            builder.setOnDismissListener(dialog -> requestPermissions(new String[]{Manifest.permission.READ_EXTERNAL_STORAGE}, PERMISSION_REQUEST_READ_STORAGE));
             builder.show();
             return false;
         }

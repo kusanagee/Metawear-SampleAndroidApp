@@ -39,13 +39,14 @@ import android.view.ViewGroup;
 import android.widget.Button;
 import android.widget.EditText;
 
-import com.mbientlab.metawear.AsyncOperation.CompletionHandler;
 import com.mbientlab.metawear.UnsupportedModuleException;
 import com.mbientlab.metawear.app.help.HelpOption;
 import com.mbientlab.metawear.app.help.HelpOptionAdapter;
 import com.mbientlab.metawear.module.IBeacon;
 
 import java.util.UUID;
+
+import bolts.Task;
 
 /**
  * Created by etsai on 8/22/2015.
@@ -60,7 +61,6 @@ public class IBeaconFragment extends ModuleFragmentBase {
         };
     }
 
-    private CompletionHandler<IBeacon.Configuration> readConfigHandler;
     private boolean isReady;
     private IBeacon ibeaconModule;
 
@@ -77,7 +77,20 @@ public class IBeaconFragment extends ModuleFragmentBase {
         isReady= true;
         ibeaconModule= mwBoard.getModule(IBeacon.class);
 
-        ibeaconModule.readConfiguration().onComplete(readConfigHandler);
+        ibeaconModule.readConfiguration().continueWith(task -> {
+            final int[] configEditText= new int[] {
+                    R.id.ibeacon_uuid_value, R.id.ibeacon_major_value, R.id.ibeacon_minor_value, R.id.ibeacon_rx_power_value,
+                    R.id.ibeacon_tx_power_value, R.id.ibeacon_period_value
+            };
+            Object[] values= new Object[] {task.getResult().uuid(), task.getResult().major(), task.getResult().minor(),
+                    task.getResult().rxPower(), task.getResult().txPower(), task.getResult().period()
+            };
+            for (int i= 0; i < values.length; i++) {
+                ((EditText) getView().findViewById(configEditText[i])).setText(values[i].toString());
+            }
+
+            return null;
+        }, Task.UI_THREAD_EXECUTOR);
     }
 
     @Override
@@ -184,23 +197,5 @@ public class IBeaconFragment extends ModuleFragmentBase {
                 ibeaconModule.disable();
             }
         });
-
-        readConfigHandler = new CompletionHandler<IBeacon.Configuration>() {
-            @Override
-            public void success(IBeacon.Configuration result) {
-                final int[] configEditText= new int[] {
-                        R.id.ibeacon_uuid_value, R.id.ibeacon_major_value, R.id.ibeacon_minor_value, R.id.ibeacon_rx_power_value,
-                        R.id.ibeacon_tx_power_value, R.id.ibeacon_period_value
-                };
-                Object[] values= new Object[] {result.adUuid(), result.major(), result.minor(), result.rxPower(), result.txPower(), result.adPeriod()};
-                for (int i= 0; i < values.length; i++) {
-                    ((EditText) view.findViewById(configEditText[i])).setText(values[i].toString());
-                }
-            }
-        };
-
-        if (isReady) {
-            ibeaconModule.readConfiguration().onComplete(readConfigHandler);
-        }
     }
 }

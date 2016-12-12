@@ -46,7 +46,7 @@ import android.view.View;
 import android.view.ViewGroup;
 import android.widget.ListView;
 
-import com.mbientlab.metawear.MetaWearBleService;
+import com.mbientlab.metawear.android.BtleService;
 import com.mbientlab.metawear.MetaWearBoard;
 import com.mbientlab.metawear.UnsupportedModuleException;
 import com.mbientlab.metawear.app.help.HelpOptionAdapter;
@@ -107,7 +107,7 @@ public abstract class ModuleFragmentBase extends Fragment implements ServiceConn
         }
 
         fragBus= (FragmentBus) owner;
-        owner.getApplicationContext().bindService(new Intent(owner, MetaWearBleService.class), this, Context.BIND_AUTO_CREATE);
+        owner.getApplicationContext().bindService(new Intent(owner, BtleService.class), this, Context.BIND_AUTO_CREATE);
     }
 
     @Override
@@ -133,7 +133,7 @@ public abstract class ModuleFragmentBase extends Fragment implements ServiceConn
 
     @Override
     public void onServiceConnected(ComponentName componentName, IBinder iBinder) {
-        mwBoard= ((MetaWearBleService.LocalBinder) iBinder).getMetaWearBoard(fragBus.getBtDevice());
+        mwBoard= ((BtleService.LocalBinder) iBinder).getMetaWearBoard(fragBus.getBtDevice());
         try {
             boardReady= true;
             boardReady();
@@ -153,11 +153,7 @@ public abstract class ModuleFragmentBase extends Fragment implements ServiceConn
         new AlertDialog.Builder(getActivity()).setTitle(R.string.title_error)
                 .setMessage(String.format("%s %s", getContext().getString(sensorResId), getActivity().getString(R.string.error_unsupported_module)))
                 .setCancelable(false)
-                .setPositiveButton(R.string.label_ok, new DialogInterface.OnClickListener() {
-                    public void onClick(DialogInterface dialog, int id) {
-                        enableDisableViewGroup((ViewGroup) getView(), false);
-                    }
-                })
+                .setPositiveButton(R.string.label_ok, (dialog, id) -> enableDisableViewGroup((ViewGroup) getView(), false))
                 .create()
                 .show();
     }
